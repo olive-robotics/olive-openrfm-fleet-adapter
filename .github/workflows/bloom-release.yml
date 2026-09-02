@@ -1,0 +1,444 @@
+name: ROS Bloom Release
+
+on:
+  push:
+    tags:
+      - '*.*.*'
+
+# The built-in GITHUB_TOKEN only needs to read this source repository.
+# Cross-repository writes use ROS_RELEASE_PAT.
+permissions:
+  contents: read
+
+# Never run two Bloom releases for this repository simultaneously.
+concurrency:
+  group: bloom-release-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  # Name used in ros/rosdistro
+  ROS_REPOSITORY_NAME: olive-openrfm-fleet-adapter
+
+  # GitHub account containing the rosdistro fork
+  BLOOM_GITHUB_USER: SamuelHafner
+
+  # The PAT stored under:
+  # Settings -> Secrets and variables -> Actions
+  GH_TOKEN: ${{ secrets.ROS_RELEASE_PAT }}
+
+jobs:
+  release:
+    name: Bloom release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+
+      # ------------------------------------------------------------
+      # Checkout
+      # ------------------------------------------------------------
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+
+      # ------------------------------------------------------------
+      # Detect ROS distribution
+      #
+      # Safety rule:
+      #
+      # tag commit only on humble -> Humble
+      # tag commit only on jazzy  -> Jazzy
+      # both                      -> FAIL
+      # neither                   -> FAIL
+      # ------------------------------------------------------------
+
+      - name: Determine ROS distribution
+        id: distro
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch origin \
+            '+refs/heads/*:refs/remotes/origin/*' \
+            --prune
+
+          COMMIT="$(git rev-parse HEAD)"
+
+          echo "Release commit: $COMMIT"
+
+          DISTROS=(humble jazzy)
+          MATCHES=()
+
+          for DISTRO in "${DISTROS[@]}"; do
+
+            # Branch may not exist yet, e.g. jazzy initially.
+            if ! git show-ref \
+              --verify \
+              --quiet \
+              "refs/remotes/origin/$DISTRO"; then
+
+              echo "$DISTRO branch does not exist"
+              continue
+            fi
+
+            if git merge-base \
+              --is-ancestor \
+              "$COMMIT" \
+              "origin/$DISTRO"; then
+
+              echo "Commit belongs to $DISTRO"
+              MATCHES+=("$DISTRO")
+            else
+              echo "Commit does not belong to $DISTRO"
+            fi
+
+          done
+
+          if [ "${#MATCHES[@]}" -ne 1 ]; then
+            echo
+            echo "ERROR: Could not uniquely determine ROS distribution."
+            echo "Matches: ${MATCHES[*]:-none}"
+            echo
+            echo "A release tag must belong to exactly one distro branch."
+            exit 1
+          fi
+
+          DISTRO="${MATCHES[0]}"
+
+          echo
+          echo "Releasing for ROS 2: $DISTRO"
+
+          echo "name=$DISTRO" >> "$GITHUB_OUTPUT"
+
+
+      # ------------------------------------------------------------
+      # Verify version
+      #
+      # Your package.xml is inside:
+      # olive_openrmf_fleet_adapter/package.xml
+      #
+      # This finds it automatically.
+      # ------------------------------------------------------------
+
+      - name: Verify release version
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t PACKAGE_XMLS < <(
+            find . \
+              -name package.xml \
+              -not -path './.git/*'
+          )
+
+          if [ "${#PACKAGE_XMLS[@]}" -ne 1 ]; then
+            echo "ERROR: Expected exactly one package.xml."
+            printf '%s\n' "${PACKAGE_XMLS[@]}"
+            exit 1
+          fi
+
+          PACKAGE_XML="${PACKAGE_XMLS[0]}"
+
+          echo "Using $PACKAGE_XML"
+
+          PACKAGE_NAME="$(
+            python3 - "$PACKAGE_XML" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(sys.argv[1]).getroot()
+          print(root.findtext("name"))
+          PY
+          )"
+
+          VERSION="$(
+            python3 - "$PACKAGE_XML" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse(sys.argv[1]).getroot()
+          print(root.findtext("version"))
+          PY
+          )"
+
+          TAG="$GITHUB_REF_NAME"
+
+          echo "Package: $PACKAGE_NAME"
+          echo "Version: $VERSION"
+          echo "Tag:     $TAG"
+
+          if ! [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: Tag is not a release version."
+            exit 1
+          fi
+
+          if [ "$TAG" != "$VERSION" ]; then
+            echo "ERROR: Git tag and package.xml version differ."
+            exit 1
+          fi
+
+          echo "name=$PACKAGE_NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+
+      # ------------------------------------------------------------
+      # Install Bloom
+      #
+      # Use a virtual environment so we do not modify the runner's
+      # system Python installation.
+      # ------------------------------------------------------------
+
+      - name: Install Bloom
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y python3-venv
+
+          python3 -m venv "$RUNNER_TEMP/bloom-venv"
+
+          "$RUNNER_TEMP/bloom-venv/bin/pip" \
+            install --upgrade pip
+
+          "$RUNNER_TEMP/bloom-venv/bin/pip" \
+            install \
+            bloom==0.14.3 \
+            rosdep
+
+          echo "$RUNNER_TEMP/bloom-venv/bin" >> "$GITHUB_PATH"
+
+
+      # ------------------------------------------------------------
+      # Configure GitHub + Bloom authentication
+      # ------------------------------------------------------------
+
+      - name: Configure authentication
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Git commits created by Bloom
+          git config --global \
+            user.name "Olive ROS Release"
+
+          git config --global \
+            user.email "github-actions@olive-robotics.com"
+
+          # gh and Git use ROS_RELEASE_PAT via GH_TOKEN.
+          gh auth setup-git
+
+          echo "Authenticated GitHub user:"
+          gh api user --jq '.login'
+
+          # Bloom uses its own config file for GitHub API access.
+          mkdir -p "$HOME/.config"
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          config = {
+              "github_user": os.environ["BLOOM_GITHUB_USER"],
+              "oauth_token": os.environ["GH_TOKEN"],
+          }
+
+          path = Path.home() / ".config" / "bloom"
+          path.write_text(json.dumps(config))
+          PY
+
+          chmod 600 "$HOME/.config/bloom"
+
+
+      # ------------------------------------------------------------
+      # Initialize rosdep
+      # ------------------------------------------------------------
+
+      - name: Initialize rosdep
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo "$RUNNER_TEMP/bloom-venv/bin/rosdep" init || true
+          rosdep update
+
+
+      # ------------------------------------------------------------
+      # Make sure your rosdistro fork exists
+      # ------------------------------------------------------------
+
+      - name: Check rosdistro fork
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if gh repo view \
+            "$BLOOM_GITHUB_USER/rosdistro" \
+            >/dev/null 2>&1; then
+
+            echo "rosdistro fork already exists."
+
+          else
+
+            echo "Creating rosdistro fork..."
+
+            gh repo fork \
+              ros/rosdistro \
+              --clone=false
+
+          fi
+
+
+      # ------------------------------------------------------------
+      # Release through Bloom
+      #
+      # This updates:
+      #
+      # olive-openrfm-fleet-adapter-release
+      #
+      # but intentionally does NOT let Bloom create the rosdistro PR.
+      # ------------------------------------------------------------
+
+      - name: Run Bloom release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DISTRO="${{ steps.distro.outputs.name }}"
+
+          echo "Running Bloom for $DISTRO"
+
+          bloom-release \
+            --rosdistro "$DISTRO" \
+            --track "$DISTRO" \
+            "$ROS_REPOSITORY_NAME" \
+            --no-pull-request
+
+
+      # ------------------------------------------------------------
+      # Ask Bloom to generate the rosdistro change.
+      #
+      # Bloom will:
+      #
+      # - modify <distro>/distribution.yaml
+      # - create bloom-... branch
+      # - push branch to SamuelHafner/rosdistro
+      #
+      # Bloom may then receive HTTP 403 when opening the PR.
+      # We intentionally tolerate that part.
+      # ------------------------------------------------------------
+
+      - name: Generate rosdistro PR branch
+        id: rosdistro
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          DISTRO="${{ steps.distro.outputs.name }}"
+
+          set +e
+
+          bloom-release \
+            --rosdistro "$DISTRO" \
+            --track "$DISTRO" \
+            "$ROS_REPOSITORY_NAME" \
+            --pull-request-only \
+            2>&1 | tee "$RUNNER_TEMP/bloom-pr.log"
+
+          BLOOM_EXIT="${PIPESTATUS[0]}"
+
+          set -e
+
+          echo "Bloom PR command exit code: $BLOOM_EXIT"
+
+          # Bloom prints:
+          #
+          # Create a pull request for 'bloom-olive-...-0'
+          #
+          # Extract that branch name.
+          PR_BRANCH="$(
+            sed -n \
+              "s/.*Create a pull request for '\([^']*\)'.*/\1/p" \
+              "$RUNNER_TEMP/bloom-pr.log" \
+              | tail -n 1
+          )"
+
+          if [ -z "$PR_BRANCH" ]; then
+            echo
+            echo "ERROR: Bloom did not create a rosdistro branch."
+            echo
+            echo "Stopping instead of guessing."
+            exit 1
+          fi
+
+          echo "Bloom rosdistro branch: $PR_BRANCH"
+
+          echo "branch=$PR_BRANCH" >> "$GITHUB_OUTPUT"
+
+
+      # ------------------------------------------------------------
+      # Open PR manually with GitHub CLI
+      #
+      # This is the automated equivalent of the command we used
+      # manually after Bloom returned HTTP 403.
+      # ------------------------------------------------------------
+
+      - name: Create rosdistro pull request
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DISTRO="${{ steps.distro.outputs.name }}"
+          VERSION="${{ steps.package.outputs.version }}"
+          PACKAGE="${{ steps.package.outputs.name }}"
+          PR_BRANCH="${{ steps.rosdistro.outputs.branch }}"
+
+          echo "Checking for an existing PR..."
+
+          EXISTING_PR="$(
+            gh pr list \
+              --repo ros/rosdistro \
+              --state open \
+              --head "${BLOOM_GITHUB_USER}:${PR_BRANCH}" \
+              --json url \
+              --jq '.[0].url // empty'
+          )"
+
+          if [ -n "$EXISTING_PR" ]; then
+            echo "PR already exists:"
+            echo "$EXISTING_PR"
+            exit 0
+          fi
+
+          # Use Bloom's generated commit title.
+          TITLE="$(
+            gh api \
+              "repos/${BLOOM_GITHUB_USER}/rosdistro/commits/${PR_BRANCH}" \
+              --jq '.commit.message | split("\n")[0]'
+          )"
+
+          BODY="$(cat <<EOF
+          Automated Bloom release of \`${PACKAGE}\` ${VERSION} for ROS 2 ${DISTRO}.
+
+          Source:
+          https://github.com/olive-robotics/olive-openrfm-fleet-adapter
+
+          Release repository:
+          https://github.com/olive-robotics/olive-openrfm-fleet-adapter-release
+
+          Generated with Bloom and submitted using GitHub Actions.
+          EOF
+          )"
+
+          gh pr create \
+            --repo ros/rosdistro \
+            --base master \
+            --head "${BLOOM_GITHUB_USER}:${PR_BRANCH}" \
+            --title "$TITLE" \
+            --body "$BODY"
