@@ -21,7 +21,7 @@ env:
 
   # GitHub account containing the rosdistro fork
   BLOOM_GITHUB_USER: SamuelHafner
-
+  RELEASE_REPOSITORY_URL: https://github.com/olive-robotics/olive-openrfm-fleet-adapter-release.git
   # The PAT stored under:
   # Settings -> Secrets and variables -> Actions
   GH_TOKEN: ${{ secrets.ROS_RELEASE_PAT }}
@@ -317,6 +317,7 @@ jobs:
           bloom-release \
             --rosdistro "$DISTRO" \
             --track "$DISTRO" \
+            --override-release-repository-url "$RELEASE_REPOSITORY_URL" \
             "$ROS_REPOSITORY_NAME" \
             --no-pull-request
 
